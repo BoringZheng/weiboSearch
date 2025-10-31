@@ -180,13 +180,8 @@ def run_spider(params: dict) -> None:
         if not opened:
             print("未找到结果文件，请检查爬虫输出目录。")
     finally:
-        # 关闭HTTP服务器以退出主线程
-        httpd = globals().get("HTTPD")
-        if httpd:
-            try:
-                httpd.shutdown()
-            except Exception:
-                pass
+        # 在控制台提示用户可以关闭浏览器页面
+        print("爬取完成，您可以关闭浏览器页面了。")
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -203,24 +198,28 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/run":
-            # Read posted form data
+            # 读取表单数据
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length).decode('utf-8')
             params = urllib.parse.parse_qs(body)
-            # Flatten single‑value lists
             flattened = {k: v[0] for k, v in params.items()}
 
-            # Run the spider in a separate thread so we can return immediately
-            thread = threading.Thread(target=run_spider, args=(flattened,))
-            thread.daemon = True
-            thread.start()
+            # 同步运行爬虫，阻塞直到结束
+            run_spider(flattened)
 
+            # 返回爬取完成页面
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(
-                "已开始爬取，爬虫正在后台运行，请耐心等待结果生成。".encode("utf-8")
-            )
+            self.wfile.write("爬取完成，请关闭此页面。".encode("utf-8"))
+
+            # 爬虫结束后关闭HTTP服务器
+            def shutdown_server():
+                httpd = globals().get("HTTPD")
+                if httpd:
+                    httpd.shutdown()
+            # 使用计时器延迟关闭，确保响应完成发送
+            threading.Timer(0.5, shutdown_server).start()
         else:
             self.send_error(404, "Not Found")
 
