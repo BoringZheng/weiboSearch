@@ -105,73 +105,96 @@ HTML_FORM = """
 
 
 def run_spider(params: dict) -> None:
-    """Run the Scrapy spider with dynamic settings derived from HTML form.
-
-    Args:
-        params: A dictionary with keys corresponding to form field names.
     """
-    # Prepare dynamic settings
+    读取网页表单参数，并在开爬前直接覆盖 SearchSpider 的类属性，
+    以绕过其在类定义阶段就从 settings 取默认值的问题。
+    """
+    # 1) 解析表单
     keywords_raw = params.get("keywords", "").strip()
+    keyword_list: list[str] = []
     if keywords_raw:
-        # Split lines and then split by whitespace within each line
-        keyword_list = []
         for line in keywords_raw.splitlines():
             line = line.strip()
-            if not line:
-                continue
-            # If the line contains spaces, treat the entire line as one
-            # keyword (Scrapy accepts space‐separated keywords for AND search)
-            keyword_list.append(line)
-    else:
-        keyword_list = []
+            if line:
+                # 一整行作为一个条件（行内空格表示“同时包含多个关键词”）
+                keyword_list.append(line)
 
-    # Convert numeric parameters; default to 0 if missing
     weibo_type = int(params.get("weibo_type", 0))
     contain_type = int(params.get("contain_type", 0))
 
-    # Region: split by comma and strip whitespace
     region_raw = params.get("region", "全部").strip()
-    if region_raw:
-        region_list = [r.strip() for r in region_raw.split(",") if r.strip()]
-    else:
-        region_list = ["全部"]
+    region_list = [r.strip() for r in region_raw.split(",") if r.strip()] or ["全部"]
 
     start_date = params.get("start_date") or "2025-10-01"
-    end_date = params.get("end_date") or "2025-10-28"
+    end_date   = params.get("end_date")   or "2025-10-28"
 
-    # Retrieve project settings and override the relevant values
-    settings = get_project_settings().copy()
-    if keyword_list:
-        settings.set("KEYWORD_LIST", keyword_list)
-    settings.set("START_DATE", start_date)
-    settings.set("END_DATE", end_date)
-    settings.set("WEIBO_TYPE", weibo_type)
-    settings.set("CONTAIN_TYPE", contain_type)
-    # If region_list contains only one element which is '全部', keep the default
-    if not (len(region_list) == 1 and region_list[0] == "全部"):
-        settings.set("REGION", region_list)
+    # 2) 导入工具并做和原 spider 相同的转换
+    from weibo.utils import util
+    from weibo.spiders.search import SearchSpider  # 放到函数里导入，确保拿到类本体
 
-    # Instantiate a CrawlerProcess with the overridden settings
-    process = CrawlerProcess(settings)
+    # 2.1 话题 #...# 转成 %23...%23（与原 spider 的处理保持一致）
+    kw_conv: list[str] = []
+    for kw in keyword_list:
+        if len(kw) > 2 and kw[0] == '#' and kw[-1] == '#':
+            kw_conv.append('%23' + kw[1:-1] + '%23')
+        else:
+            kw_conv.append(kw)
+
+    weibo_type_conv   = util.convert_weibo_type(weibo_type)
+    contain_type_conv = util.convert_contain_type(contain_type)
+    # 只有当不是“全部”时才计算省/直辖市映射
+    regions_conv = util.get_regions(region_list) if not (len(region_list) == 1 and region_list[0] == "全部") else {}
+
+    # 3) 关键：覆盖 SearchSpider 的类属性（类定义时已把 settings 值固化到这些属性里）
+    if kw_conv:
+        SearchSpider.keyword_list = kw_conv
+        SearchSpider.weibo_type   = weibo_type_conv
+        SearchSpider.contain_type = contain_type_conv
+        SearchSpider.start_date   = start_date
+        SearchSpider.end_date     = end_date
+    if regions_conv:
+        SearchSpider.regions = regions_conv
+        # 注意：start_requests 里会用 self.settings.get('REGION') 来判断是否走“地区细分”分支
+        # 因此这里也同时更新类级 settings，让条件判断生效
+        try:
+            SearchSpider.settings.set("REGION", region_list)
+        except Exception:
+            pass
+
+    # 4) 启动 Scrapy（不再依赖额外拼 settings；类属性已覆盖）
+    process = CrawlerProcess(get_project_settings())
     process.crawl(SearchSpider)
-    # 阻塞直到爬虫结束
     process.start()
 
-    # 爬虫运行结束后尝试打开生成的结果文件，并关闭HTTP服务器
+    # 5) 爬虫结束后尝试打开结果文件/目录
     try:
         from pathlib import Path
-
         results_base = Path.cwd() / "结果文件"
         opened = False
         if results_base.exists() and results_base.is_dir():
-            # 找到第一个关键词目录
-            keyword_dirs = [d for d in results_base.iterdir() if d.is_dir()]
-            if keyword_dirs:
-                first_dir = keyword_dirs[0]
-                # 寻找CSV文件
-                csv_files = list(first_dir.glob("*.csv"))
-                target = csv_files[0] if csv_files else first_dir
-                # 使用文件URI打开
+            # 尝试优先打开“用户本次第一个关键词”的目录；否则退化为第一个目录
+            prefer_name = None
+            if kw_conv:
+                # 将 %23...%23 还原为 #...# 来匹配目录名（如果你的保存目录名就是原始关键词，可以直接用原关键词）
+                def restore_hashtag(s: str) -> str:
+                    if s.startswith("%23") and s.endswith("%23"):
+                        return f"#{s[3:-3]}#"
+                    return s
+                prefer_name = restore_hashtag(kw_conv[0])
+
+            target_dir = None
+            for d in results_base.iterdir():
+                if d.is_dir() and (prefer_name is None or prefer_name in d.name):
+                    target_dir = d
+                    break
+            if not target_dir:
+                cand = [d for d in results_base.iterdir() if d.is_dir()]
+                if cand:
+                    target_dir = cand[0]
+
+            if target_dir:
+                csv_files = list(target_dir.glob("*.csv"))
+                target = csv_files[0] if csv_files else target_dir
                 try:
                     webbrowser.open_new(f"file://{target.resolve()}")
                     opened = True
@@ -180,8 +203,8 @@ def run_spider(params: dict) -> None:
         if not opened:
             print("未找到结果文件，请检查爬虫输出目录。")
     finally:
-        # 在控制台提示用户可以关闭浏览器页面
         print("爬取完成，您可以关闭浏览器页面了。")
+
 
 
 class RequestHandler(BaseHTTPRequestHandler):
