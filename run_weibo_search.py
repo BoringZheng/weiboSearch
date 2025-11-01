@@ -112,15 +112,21 @@ def run_spider(params: dict) -> None:
     读取网页表单参数，并在开爬前直接覆盖 SearchSpider 的类属性，
     以绕过其在类定义阶段就从 settings 取默认值的问题。
     """
-    # 1) 解析表单
+    # 1) 解析表单（多行=OR；行内空格=AND）
     keywords_raw = params.get("keywords", "").strip()
-    keyword_list: list[str] = []
+    # 目标结构：List[Union[str, List[str]]]
+    #   - 单词行 -> "关键词"
+    #   - 多词行 -> ["词1", "词2", ...]  表示 AND
+    keyword_items: list[object] = []
     if keywords_raw:
         for line in keywords_raw.splitlines():
             line = line.strip()
-            if line:
-                # 一整行作为一个条件（行内空格表示“同时包含多个关键词”）
-                keyword_list.append(line)
+            if not line:
+                continue
+            tokens = [t for t in line.split() if t]  # 按空格切 AND
+            if not tokens:
+                continue
+            keyword_items.append(tokens if len(tokens) > 1 else tokens[0])
 
     weibo_type = int(params.get("weibo_type", 0))
     contain_type = int(params.get("contain_type", 0))
@@ -135,34 +141,46 @@ def run_spider(params: dict) -> None:
     from weibo.utils import util
     from weibo.spiders.search import SearchSpider  # 放到函数里导入，确保拿到类本体
 
-    # 2.1 话题 #...# 转成 %23...%23（与原 spider 的处理保持一致）
-    kw_conv: list[str] = []
-    for kw in keyword_list:
-        if len(kw) > 2 and kw[0] == '#' and kw[-1] == '#':
-            kw_conv.append('%23' + kw[1:-1] + '%23')
+    # 2.1 话题 #...# 转 %23...%23（逐 token 转换）
+    def conv_token(tok: str) -> str:
+        tok = tok.strip()
+        if len(tok) > 2 and tok[0] == '#' and tok[-1] == '#':
+            return '%23' + tok[1:-1] + '%23'
+        return tok
+
+    kw_conv: list[object] = []
+    for item in keyword_items:
+        if isinstance(item, list):
+            kw_conv.append([conv_token(t) for t in item])
         else:
-            kw_conv.append(kw)
+            kw_conv.append(conv_token(str(item)))
 
     weibo_type_conv   = util.convert_weibo_type(weibo_type)
     contain_type_conv = util.convert_contain_type(contain_type)
-    # 只有当不是“全部”时才计算省/直辖市映射
-    regions_conv = util.get_regions(region_list) if not (len(region_list) == 1 and region_list[0] == "全部") else {}
+    regions_conv      = util.get_regions(region_list) if not (len(region_list)==1 and region_list[0]=="全部") else {}
 
-    # 3) 关键：覆盖 SearchSpider 的类属性（类定义时已把 settings 值固化到这些属性里）
-    if kw_conv:
+    # 3) 覆盖 SearchSpider 的类属性 + settings（两处都写，最大化兼容它的判断逻辑）
+    if kw_conv:  # 用户真的填了关键词才覆盖，否则保持原默认
         SearchSpider.keyword_list = kw_conv
-        SearchSpider.weibo_type   = weibo_type_conv
-        SearchSpider.contain_type = contain_type_conv
-        SearchSpider.start_date   = start_date
-        SearchSpider.end_date     = end_date
+        try:
+            # 有的逻辑会直接从 settings 里读 KEYWORD_LIST
+            SearchSpider.settings.set("KEYWORD_LIST", kw_conv)
+        except Exception:
+            pass
+
+    SearchSpider.weibo_type   = weibo_type_conv
+    SearchSpider.contain_type = contain_type_conv
+    SearchSpider.start_date   = start_date
+    SearchSpider.end_date     = end_date
+
     if regions_conv:
         SearchSpider.regions = regions_conv
-        # 注意：start_requests 里会用 self.settings.get('REGION') 来判断是否走“地区细分”分支
-        # 因此这里也同时更新类级 settings，让条件判断生效
         try:
+            # start_requests 里可能用 self.settings.get('REGION') 来判分支
             SearchSpider.settings.set("REGION", region_list)
         except Exception:
             pass
+
 
     # 4) 启动 Scrapy（不再依赖额外拼 settings；类属性已覆盖）
     process = CrawlerProcess(get_project_settings())
