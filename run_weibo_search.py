@@ -27,6 +27,9 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import webbrowser  # 自动打开浏览器和文件
+import os
+
+os.environ.setdefault("SCRAPY_SETTINGS_MODULE", "weibo.settings")
 
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
